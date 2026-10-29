@@ -119,7 +119,7 @@ const path = require('path');
 const URL = process.env.CATALOGUE_URL || 'https://maxtorfitness.com/catalouge/catalouge.html';
 const OUT = path.join(__dirname, 'output');
 const DATE = new Date().toISOString().slice(0, 10);
-const BATCH = Number(process.env.PDF_BATCH || 5); // 5 pages per PDF chunk on free tier
+const BATCH = Number(process.env.PDF_BATCH || 5);
 
 (async () => {
   fs.mkdirSync(OUT, { recursive: true });
@@ -197,16 +197,54 @@ const BATCH = Number(process.env.PDF_BATCH || 5); // 5 pages per PDF chunk on fr
   const total = await page.$$eval('#book .page', (els) => els.length);
   console.log(`Catalogue ready with ${total} pages. Batch size=${BATCH}`);
 
-  // Hide toolbar / overlay so they are not in the PDF
+  // Hide toolbar / overlay
   await page.evaluate(() => {
     const toolbar = document.querySelector('.toolbar');
     if (toolbar) toolbar.style.display = 'none';
     const overlay = document.getElementById('overlay');
-    if (overlay) overlay.style.display = 'none';
+    if (overlay) {
+      overlay.classList.remove('on');
+      overlay.style.display = 'none';
+    }
     document.body.classList.add('exporting');
   });
 
-  await new Promise((r) => setTimeout(r, 3000));
+  // Show all pages and force image load
+  console.log('Loading all product images…');
+  await page.evaluate(() => {
+    document.querySelectorAll('#book .slot, #book .page').forEach((el) => {
+      el.style.display = '';
+    });
+  });
+
+  const imageStats = await page.evaluate(async () => {
+    const imgs = Array.from(document.querySelectorAll('#book img'));
+    await Promise.all(
+      imgs.map((img) => {
+        try {
+          if (img.loading === 'lazy') img.loading = 'eager';
+          if (img.dataset && img.dataset.src && !img.getAttribute('src')) {
+            img.src = img.dataset.src;
+          }
+        } catch (_) {}
+        if (img.complete && img.naturalWidth > 0) return Promise.resolve();
+        return new Promise((resolve) => {
+          const done = () => resolve();
+          img.addEventListener('load', done, { once: true });
+          img.addEventListener('error', done, { once: true });
+          setTimeout(done, 10000);
+        });
+      })
+    );
+    const ok = imgs.filter((i) => i.complete && i.naturalWidth > 0).length;
+    const bad = imgs.length - ok;
+    return { total: imgs.length, ok, bad };
+  });
+
+  console.log(
+    `Images: total=${imageStats.total} loaded=${imageStats.ok} failed/empty=${imageStats.bad}`
+  );
+  await new Promise((r) => setTimeout(r, 5000));
 
   const merged = await PDFDocument.create();
 
@@ -218,11 +256,26 @@ const BATCH = Number(process.env.PDF_BATCH || 5); // 5 pages per PDF chunk on fr
       const pages = Array.from(document.querySelectorAll('#book .page'));
       pages.forEach((p, i) => {
         const wrap = p.closest('.slot') || p;
-        wrap.style.display = i >= s && i < e ? '' : 'none';
+        wrap.style.display = i >= s && i < e ? 'block' : 'none';
       });
     }, start, end);
 
-    await new Promise((r) => setTimeout(r, 1500));
+    await page.evaluate(async (s, e) => {
+      const pages = Array.from(document.querySelectorAll('#book .page')).slice(s, e);
+      const imgs = pages.flatMap((p) => Array.from(p.querySelectorAll('img')));
+      await Promise.all(
+        imgs.map((img) => {
+          if (img.complete && img.naturalWidth > 0) return Promise.resolve();
+          return new Promise((resolve) => {
+            img.addEventListener('load', resolve, { once: true });
+            img.addEventListener('error', resolve, { once: true });
+            setTimeout(resolve, 8000);
+          });
+        })
+      );
+    }, start, end);
+
+    await new Promise((r) => setTimeout(r, 2000));
 
     const buf = await page.pdf({
       format: 'A4',
@@ -230,29 +283,22 @@ const BATCH = Number(process.env.PDF_BATCH || 5); // 5 pages per PDF chunk on fr
       printBackground: true,
       margin: { top: 0, right: 0, bottom: 0, left: 0 },
       preferCSSPageSize: true,
-      scale: 0.55,
     });
 
     const part = await PDFDocument.load(buf);
-    const indices = part.getPageIndices();
-    const copied = await merged.copyPages(part, indices);
+    const copied = await merged.copyPages(part, part.getPageIndices());
     copied.forEach((p) => merged.addPage(p));
-
-    // free memory between batches
-    if (global.gc) {
-      try { global.gc(); } catch (_) {}
-    }
   }
 
   const dated = path.join(OUT, `maxtor-catalogue-${DATE}.pdf`);
   const latest = path.join(OUT, 'latest.pdf');
-  const bytes = await merged.save();
-  fs.writeFileSync(dated, Buffer.from(bytes));
+  fs.writeFileSync(dated, Buffer.from(await merged.save()));
   fs.copyFileSync(dated, latest);
 
   await browser.close();
   console.log('Saved', dated);
   console.log('Saved', latest);
+  console.log(`Merged PDF page count target was ${total} source pages`);
 })().catch((err) => {
   console.error(err);
   process.exit(1);
