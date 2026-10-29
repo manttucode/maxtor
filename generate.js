@@ -112,17 +112,13 @@
 
 const puppeteer = require('puppeteer-core');
 const chromium = require('@sparticuz/chromium');
-const { PDFDocument } = require('pdf-lib');
 const fs = require('fs');
 const path = require('path');
 
 const URL = process.env.CATALOGUE_URL || 'https://maxtorfitness.com/catalouge/catalouge.html';
 const OUT = path.join(__dirname, 'output');
 const DATE = new Date().toISOString().slice(0, 10);
-
-// A4 landscape points (72 dpi)
-const PAGE_W = 841.89;
-const PAGE_H = 595.28;
+const EXPORT_TIMEOUT_MS = Number(process.env.PDF_EXPORT_TIMEOUT_MS || 90 * 60 * 1000); // 90 min
 
 (async () => {
   fs.mkdirSync(OUT, { recursive: true });
@@ -137,23 +133,26 @@ const PAGE_H = 595.28;
       '--no-zygote',
       '--disable-web-security',
       '--allow-running-insecure-content',
-      '--js-flags=--max-old-space-size=350',
+      '--js-flags=--max-old-space-size=400',
     ],
     defaultViewport: { width: 1400, height: 900 },
     executablePath: await chromium.executablePath(),
     headless: chromium.headless,
-    protocolTimeout: 60 * 60 * 1000,
+    protocolTimeout: 2 * 60 * 60 * 1000, // 2 hours
   });
 
   const page = await browser.newPage();
   await page.setBypassCSP(true);
   await page.setViewport({ width: 1400, height: 900 });
-  page.setDefaultTimeout(60 * 60 * 1000);
+  page.setDefaultTimeout(2 * 60 * 60 * 1000);
 
-  page.on('requestfailed', (req) => {
-    const u = req.url();
-    if (/\.(png|jpe?g|webp|gif|svg)(\?|$)/i.test(u)) {
-      console.log('IMG FAIL:', u.slice(0, 120), req.failure()?.errorText || '');
+  page.on('console', (msg) => {
+    const t = msg.type();
+    if (t === 'error' || t === 'warning' || t === 'log') {
+      const text = msg.text();
+      if (/pdf|export|canvas|image|error|fail/i.test(text)) {
+        console.log('PAGE:', text.slice(0, 200));
+      }
     }
   });
 
@@ -177,16 +176,17 @@ const PAGE_H = 595.28;
         statusText: status ? status.textContent.trim() : '',
         hasError: !!err,
         errorText: err ? err.textContent.trim().slice(0, 300) : '',
+        hasBtn: !!document.getElementById('btnPdf'),
       };
     });
 
-    const line = `pages=${state.pageCount} overlayOn=${state.overlayOn} status="${state.statusText}"`;
+    const line = `pages=${state.pageCount} overlayOn=${state.overlayOn} btnPdf=${state.hasBtn} status="${state.statusText}"`;
     if (line !== lastLog) {
       console.log(line);
       lastLog = line;
     }
 
-    if (state.hasError) throw new Error(state.errorText);
+    if (state.hasError) throw new Error('Catalogue error: ' + state.errorText);
     if (state.pageCount > 2 && !state.overlayOn) {
       ready = true;
       break;
@@ -201,112 +201,132 @@ const PAGE_H = 595.28;
   if (!ready) throw new Error('Catalogue did not finish building.');
 
   const total = await page.$$eval('#book .page', (els) => els.length);
-  console.log(`Ready: ${total} pages`);
+  console.log(`Catalogue ready with ${total} pages. Starting in-page PDF export…`);
 
-  // Hide UI chrome
+  // Give images a bit more time before export (same as a slow local run)
   await page.evaluate(() => {
-    const toolbar = document.querySelector('.toolbar');
-    if (toolbar) toolbar.style.display = 'none';
-    const overlay = document.getElementById('overlay');
-    if (overlay) {
-      overlay.classList.remove('on');
-      overlay.style.display = 'none';
-    }
-    document.body.classList.add('exporting');
-    document.querySelectorAll('#book .slot, #book .page').forEach((el) => {
-      el.style.display = '';
-    });
-  });
-
-  // Eager-load images
-  console.log('Waiting for images to load…');
-  await page.evaluate(() => {
-    document.querySelectorAll('#book img').forEach((img) => {
+    document.querySelectorAll('img').forEach((img) => {
       try {
         if (img.loading === 'lazy') img.loading = 'eager';
         if (img.dataset?.src) img.src = img.dataset.src;
       } catch (_) {}
     });
   });
+  await new Promise((r) => setTimeout(r, 10000));
 
-  await page.evaluate(async () => {
-    const imgs = Array.from(document.querySelectorAll('#book img'));
-    await Promise.all(
-      imgs.map(
-        (img) =>
-          new Promise((resolve) => {
-            if (img.complete && img.naturalWidth > 0) return resolve();
-            img.addEventListener('load', resolve, { once: true });
-            img.addEventListener('error', resolve, { once: true });
-            setTimeout(resolve, 12000);
-          })
-      )
+  // Capture PDF blob when the page's own exporter creates it
+  await page.evaluate(() => {
+    window.__maxtorPdfBlob = null;
+    window.__maxtorPdfError = null;
+
+    const orig = URL.createObjectURL.bind(URL);
+    URL.createObjectURL = function (obj) {
+      try {
+        if (obj && typeof Blob !== 'undefined' && obj instanceof Blob) {
+          if (obj.type === 'application/pdf' || obj.size > 50000) {
+            window.__maxtorPdfBlob = obj;
+          }
+        }
+      } catch (_) {}
+      return orig(obj);
+    };
+
+    // Also intercept <a download> clicks that use blob: URLs
+    document.addEventListener(
+      'click',
+      (e) => {
+        const a = e.target && e.target.closest ? e.target.closest('a[download]') : null;
+        if (a && a.href && a.href.startsWith('blob:')) {
+          // blob already captured via createObjectURL in most exporters
+        }
+      },
+      true
     );
   });
 
-  const stats = await page.$$eval('#book img', (imgs) => {
-    const ok = imgs.filter((i) => i.complete && i.naturalWidth > 0).length;
-    const sample = imgs.slice(0, 3).map((i) => ({
-      src: (i.currentSrc || i.src || '').slice(0, 80),
-      w: i.naturalWidth,
-      complete: i.complete,
-    }));
-    return { total: imgs.length, ok, bad: imgs.length - ok, sample };
+  // Click the same button you use locally
+  const clicked = await page.evaluate(() => {
+    const btn = document.getElementById('btnPdf');
+    if (!btn) return false;
+    btn.disabled = false;
+    btn.click();
+    return true;
   });
-  console.log('Image stats:', JSON.stringify(stats));
 
-  await new Promise((r) => setTimeout(r, 3000));
-
-  // Screenshot each .page → JPEG → PDF page (WYSIWYG, includes images)
-  const pdf = await PDFDocument.create();
-  const handles = await page.$$('#book .page');
-
-  for (let i = 0; i < handles.length; i++) {
-    console.log(`Screenshot page ${i + 1}/${handles.length}`);
-
-    // Scroll into view so lazy layouts paint
-    await handles[i].evaluate((el) => {
-      const wrap = el.closest('.slot') || el;
-      wrap.style.display = 'block';
-      el.scrollIntoView({ block: 'center' });
+  if (!clicked) {
+    // Fallback: try common labels
+    const alt = await page.evaluate(() => {
+      const nodes = Array.from(document.querySelectorAll('button, a.btn, [role="button"]'));
+      const btn = nodes.find((n) => /pdf|download/i.test(n.textContent || ''));
+      if (!btn) return false;
+      btn.click();
+      return true;
     });
-    await new Promise((r) => setTimeout(r, 400));
+    if (!alt) throw new Error('Could not find PDF export button (btnPdf)');
+  }
 
-    let shot;
-    try {
-      shot = await handles[i].screenshot({
-        type: 'jpeg',
-        quality: 82,
-      });
-    } catch (err) {
-      console.log('Screenshot failed for page', i + 1, err.message);
-      continue;
-    }
+  console.log('Export started — waiting for PDF blob (up to 90 min)…');
 
-    const img = await pdf.embedJpg(shot);
-    const pageDoc = pdf.addPage([PAGE_W, PAGE_H]);
-    pageDoc.drawImage(img, {
-      x: 0,
-      y: 0,
-      width: PAGE_W,
-      height: PAGE_H,
+  const waitStart = Date.now();
+  let gotBlob = false;
+
+  while (Date.now() - waitStart < EXPORT_TIMEOUT_MS) {
+    const status = await page.evaluate(() => {
+      const overlay = document.getElementById('overlay');
+      const ovMsg = document.getElementById('ovMsg');
+      return {
+        hasBlob: !!(window.__maxtorPdfBlob && window.__maxtorPdfBlob.size > 0),
+        size: window.__maxtorPdfBlob ? window.__maxtorPdfBlob.size : 0,
+        overlayOn: !!(overlay && overlay.classList.contains('on')),
+        msg: ovMsg ? ovMsg.textContent.trim() : '',
+        err: window.__maxtorPdfError || null,
+      };
     });
 
-    // free memory pressure
-    if ((i + 1) % 10 === 0 && global.gc) {
-      try {
-        global.gc();
-      } catch (_) {}
+    if (status.err) throw new Error(String(status.err));
+
+    if (status.hasBlob) {
+      console.log('PDF blob ready, size=', status.size);
+      gotBlob = true;
+      break;
     }
+
+    if (status.msg) {
+      console.log('Export progress:', status.msg);
+    }
+
+    await new Promise((r) => setTimeout(r, 5000));
+  }
+
+  if (!gotBlob) {
+    throw new Error('Timed out waiting for in-page PDF blob. Check PAGE: logs above.');
+  }
+
+  // Read blob → base64 → file
+  const b64 = await page.evaluate(async () => {
+    const blob = window.__maxtorPdfBlob;
+    const buf = await blob.arrayBuffer();
+    const bytes = new Uint8Array(buf);
+    const chunk = 0x8000;
+    let binary = '';
+    for (let i = 0; i < bytes.length; i += chunk) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+    }
+    return btoa(binary);
+  });
+
+  const pdfBuffer = Buffer.from(b64, 'base64');
+  if (pdfBuffer.length < 1000) {
+    throw new Error('PDF buffer too small: ' + pdfBuffer.length);
   }
 
   const dated = path.join(OUT, `maxtor-catalogue-${DATE}.pdf`);
   const latest = path.join(OUT, 'latest.pdf');
-  fs.writeFileSync(dated, Buffer.from(await pdf.save()));
+  fs.writeFileSync(dated, pdfBuffer);
   fs.copyFileSync(dated, latest);
 
   await browser.close();
-  console.log('Saved', dated);
+  console.log('Saved', dated, '(' + pdfBuffer.length + ' bytes)');
   console.log('Saved', latest);
 })().catch((err) => {
   console.error(err);
