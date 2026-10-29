@@ -16,6 +16,7 @@ const DATE = new Date().toISOString().slice(0, 10);
     defaultViewport: chromium.defaultViewport,
     executablePath: await chromium.executablePath(),
     headless: chromium.headless,
+    protocolTimeout: 60 * 60 * 1000,
   });
 
   const page = await browser.newPage();
@@ -94,6 +95,7 @@ const DATE = new Date().toISOString().slice(0, 10);
     printBackground: true,
     margin: { top: 0, right: 0, bottom: 0, left: 0 },
     preferCSSPageSize: true,
+    timeout: 60 * 60 * 1000,
   });
 
   fs.copyFileSync(dated, latest);
