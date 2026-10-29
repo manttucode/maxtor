@@ -118,7 +118,9 @@ const path = require('path');
 const URL = process.env.CATALOGUE_URL || 'https://maxtorfitness.com/catalouge/catalouge.html';
 const OUT = path.join(__dirname, 'output');
 const DATE = new Date().toISOString().slice(0, 10);
-const EXPORT_TIMEOUT_MS = Number(process.env.PDF_EXPORT_TIMEOUT_MS || 90 * 60 * 1000); // 90 min
+const EXPORT_TIMEOUT_MS = Number(process.env.PDF_EXPORT_TIMEOUT_MS || 90 * 60 * 1000);
+const MIN_PDF_BYTES = Number(process.env.MIN_PDF_BYTES || 500 * 1024); // 500 KB
+const IMAGE_DELAY_MS = Number(process.env.IMAGE_DELAY_MS || 200); // slow images to avoid 429
 
 (async () => {
   fs.mkdirSync(OUT, { recursive: true });
@@ -138,7 +140,7 @@ const EXPORT_TIMEOUT_MS = Number(process.env.PDF_EXPORT_TIMEOUT_MS || 90 * 60 * 
     defaultViewport: { width: 1400, height: 900 },
     executablePath: await chromium.executablePath(),
     headless: chromium.headless,
-    protocolTimeout: 2 * 60 * 60 * 1000, // 2 hours
+    protocolTimeout: 2 * 60 * 60 * 1000,
   });
 
   const page = await browser.newPage();
@@ -146,13 +148,30 @@ const EXPORT_TIMEOUT_MS = Number(process.env.PDF_EXPORT_TIMEOUT_MS || 90 * 60 * 
   await page.setViewport({ width: 1400, height: 900 });
   page.setDefaultTimeout(2 * 60 * 60 * 1000);
 
+  // Throttle image requests to reduce 429
+  await page.setRequestInterception(true);
+  let imageQueue = Promise.resolve();
+  page.on('request', (req) => {
+    if (req.resourceType() === 'image') {
+      imageQueue = imageQueue
+        .then(() => new Promise((r) => setTimeout(r, IMAGE_DELAY_MS)))
+        .then(() => req.continue())
+        .catch(() => req.continue().catch(() => {}));
+    } else {
+      req.continue().catch(() => {});
+    }
+  });
+
   page.on('console', (msg) => {
-    const t = msg.type();
-    if (t === 'error' || t === 'warning' || t === 'log') {
-      const text = msg.text();
-      if (/pdf|export|canvas|image|error|fail/i.test(text)) {
-        console.log('PAGE:', text.slice(0, 200));
-      }
+    const text = msg.text();
+    if (/pdf|export|canvas|Rendering|error|fail|429/i.test(text)) {
+      console.log('PAGE:', text.slice(0, 180));
+    }
+  });
+
+  page.on('response', (res) => {
+    if (res.status() === 429) {
+      console.log('429:', res.url().slice(0, 100));
     }
   });
 
@@ -201,9 +220,10 @@ const EXPORT_TIMEOUT_MS = Number(process.env.PDF_EXPORT_TIMEOUT_MS || 90 * 60 * 
   if (!ready) throw new Error('Catalogue did not finish building.');
 
   const total = await page.$$eval('#book .page', (els) => els.length);
-  console.log(`Catalogue ready with ${total} pages. Starting in-page PDF export…`);
+  console.log(`Catalogue ready with ${total} pages`);
 
-  // Give images a bit more time before export (same as a slow local run)
+  // Extra wait so throttled images can finish
+  console.log('Waiting for images (throttled)…');
   await page.evaluate(() => {
     document.querySelectorAll('img').forEach((img) => {
       try {
@@ -212,39 +232,53 @@ const EXPORT_TIMEOUT_MS = Number(process.env.PDF_EXPORT_TIMEOUT_MS || 90 * 60 * 
       } catch (_) {}
     });
   });
-  await new Promise((r) => setTimeout(r, 10000));
+  await new Promise((r) => setTimeout(r, 20000));
 
-  // Capture PDF blob when the page's own exporter creates it
+  // Hook blob + jsPDF
   await page.evaluate(() => {
     window.__maxtorPdfBlob = null;
-    window.__maxtorPdfError = null;
 
     const orig = URL.createObjectURL.bind(URL);
     URL.createObjectURL = function (obj) {
       try {
-        if (obj && typeof Blob !== 'undefined' && obj instanceof Blob) {
-          if (obj.type === 'application/pdf' || obj.size > 50000) {
-            window.__maxtorPdfBlob = obj;
-          }
+        if (obj instanceof Blob && (obj.type === 'application/pdf' || obj.size > 20000)) {
+          window.__maxtorPdfBlob = obj;
         }
       } catch (_) {}
       return orig(obj);
     };
 
-    // Also intercept <a download> clicks that use blob: URLs
-    document.addEventListener(
-      'click',
-      (e) => {
-        const a = e.target && e.target.closest ? e.target.closest('a[download]') : null;
-        if (a && a.href && a.href.startsWith('blob:')) {
-          // blob already captured via createObjectURL in most exporters
-        }
-      },
-      true
-    );
+    function patchJsPDF(JsPDF) {
+      if (!JsPDF || JsPDF.__maxtorPatched) return;
+      const proto = JsPDF.prototype;
+      const origSave = proto.save;
+      const origOutput = proto.output;
+      proto.save = function () {
+        try {
+          window.__maxtorPdfBlob = this.output('blob');
+        } catch (_) {}
+        return origSave.apply(this, arguments);
+      };
+      proto.output = function (type) {
+        const result = origOutput.apply(this, arguments);
+        try {
+          if (type === 'blob' && result instanceof Blob) window.__maxtorPdfBlob = result;
+        } catch (_) {}
+        return result;
+      };
+      JsPDF.__maxtorPatched = true;
+    }
+
+    try {
+      if (window.jspdf && window.jspdf.jsPDF) patchJsPDF(window.jspdf.jsPDF);
+      if (window.jsPDF) patchJsPDF(window.jsPDF);
+    } catch (_) {}
   });
 
-  // Click the same button you use locally
+  await page.evaluate(() => {
+    window.__maxtorPdfBlob = null;
+  });
+
   const clicked = await page.evaluate(() => {
     const btn = document.getElementById('btnPdf');
     if (!btn) return false;
@@ -252,57 +286,68 @@ const EXPORT_TIMEOUT_MS = Number(process.env.PDF_EXPORT_TIMEOUT_MS || 90 * 60 * 
     btn.click();
     return true;
   });
+  if (!clicked) throw new Error('btnPdf not found');
 
-  if (!clicked) {
-    // Fallback: try common labels
-    const alt = await page.evaluate(() => {
-      const nodes = Array.from(document.querySelectorAll('button, a.btn, [role="button"]'));
-      const btn = nodes.find((n) => /pdf|download/i.test(n.textContent || ''));
-      if (!btn) return false;
-      btn.click();
-      return true;
-    });
-    if (!alt) throw new Error('Could not find PDF export button (btnPdf)');
-  }
-
-  console.log('Export started — waiting for PDF blob (up to 90 min)…');
+  console.log('Export started — waiting for FINAL PDF only…');
 
   const waitStart = Date.now();
-  let gotBlob = false;
+  let accepted = false;
 
   while (Date.now() - waitStart < EXPORT_TIMEOUT_MS) {
-    const status = await page.evaluate(() => {
+    const status = await page.evaluate((minSize, totalPages) => {
       const overlay = document.getElementById('overlay');
       const ovMsg = document.getElementById('ovMsg');
+      const msg = ovMsg ? ovMsg.textContent.trim() : '';
+      const blob = window.__maxtorPdfBlob;
+      const size = blob ? blob.size : 0;
+
+      const pageMatch = msg.match(/page\s+(\d+)\s+of\s+(\d+)/i);
+      const current = pageMatch ? Number(pageMatch[1]) : 0;
+      const ofTotal = pageMatch ? Number(pageMatch[2]) : totalPages;
+
+      const doneByMsg =
+        /complete|done|finished|saved|download ready/i.test(msg) ||
+        (current > 0 && ofTotal > 0 && current >= ofTotal);
+
+      const overlayOff = !(overlay && overlay.classList.contains('on'));
+
       return {
-        hasBlob: !!(window.__maxtorPdfBlob && window.__maxtorPdfBlob.size > 0),
-        size: window.__maxtorPdfBlob ? window.__maxtorPdfBlob.size : 0,
-        overlayOn: !!(overlay && overlay.classList.contains('on')),
-        msg: ovMsg ? ovMsg.textContent.trim() : '',
-        err: window.__maxtorPdfError || null,
+        size,
+        msg,
+        current,
+        ofTotal,
+        ready: size >= minSize && (doneByMsg || (overlayOff && size >= minSize && current >= ofTotal)),
       };
-    });
-
-    if (status.err) throw new Error(String(status.err));
-
-    if (status.hasBlob) {
-      console.log('PDF blob ready, size=', status.size);
-      gotBlob = true;
-      break;
-    }
+    }, MIN_PDF_BYTES, total);
 
     if (status.msg) {
-      console.log('Export progress:', status.msg);
+      console.log(
+        `Export: "${status.msg}" blob=${status.size} page=${status.current}/${status.ofTotal}`
+      );
+    }
+
+    // Drop small intermediate blobs
+    if (status.size > 0 && status.size < MIN_PDF_BYTES) {
+      await page.evaluate(() => {
+        window.__maxtorPdfBlob = null;
+      });
+    }
+
+    if (status.ready) {
+      console.log('Final PDF accepted, size=', status.size);
+      accepted = true;
+      break;
     }
 
     await new Promise((r) => setTimeout(r, 5000));
   }
 
-  if (!gotBlob) {
-    throw new Error('Timed out waiting for in-page PDF blob. Check PAGE: logs above.');
+  if (!accepted) {
+    throw new Error(
+      'Timed out waiting for final PDF (>= ' + MIN_PDF_BYTES + ' bytes after full export)'
+    );
   }
 
-  // Read blob → base64 → file
   const b64 = await page.evaluate(async () => {
     const blob = window.__maxtorPdfBlob;
     const buf = await blob.arrayBuffer();
@@ -316,9 +361,7 @@ const EXPORT_TIMEOUT_MS = Number(process.env.PDF_EXPORT_TIMEOUT_MS || 90 * 60 * 
   });
 
   const pdfBuffer = Buffer.from(b64, 'base64');
-  if (pdfBuffer.length < 1000) {
-    throw new Error('PDF buffer too small: ' + pdfBuffer.length);
-  }
+  console.log('PDF buffer bytes=', pdfBuffer.length);
 
   const dated = path.join(OUT, `maxtor-catalogue-${DATE}.pdf`);
   const latest = path.join(OUT, 'latest.pdf');
@@ -326,7 +369,7 @@ const EXPORT_TIMEOUT_MS = Number(process.env.PDF_EXPORT_TIMEOUT_MS || 90 * 60 * 
   fs.copyFileSync(dated, latest);
 
   await browser.close();
-  console.log('Saved', dated, '(' + pdfBuffer.length + ' bytes)');
+  console.log('Saved', dated);
   console.log('Saved', latest);
 })().catch((err) => {
   console.error(err);
