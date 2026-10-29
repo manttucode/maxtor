@@ -134,6 +134,8 @@ const BATCH = Number(process.env.PDF_BATCH || 5);
       '--no-zygote',
       '--disable-extensions',
       '--disable-background-networking',
+      '--disable-web-security',
+      '--allow-running-insecure-content',
       '--js-flags=--max-old-space-size=350',
     ],
     defaultViewport: { width: 1200, height: 800 },
@@ -143,6 +145,7 @@ const BATCH = Number(process.env.PDF_BATCH || 5);
   });
 
   const page = await browser.newPage();
+  await page.setBypassCSP(true);
   await page.setViewport({ width: 1200, height: 800 });
   page.setDefaultTimeout(60 * 60 * 1000);
 
@@ -209,42 +212,83 @@ const BATCH = Number(process.env.PDF_BATCH || 5);
     document.body.classList.add('exporting');
   });
 
-  // Show all pages and force image load
-  console.log('Loading all product images…');
+  // Show all pages
   await page.evaluate(() => {
     document.querySelectorAll('#book .slot, #book .page').forEach((el) => {
       el.style.display = '';
     });
   });
 
-  const imageStats = await page.evaluate(async () => {
+  console.log('Loading + embedding product images…');
+
+  // Force eager load
+  await page.evaluate(() => {
+    document.querySelectorAll('#book img').forEach((img) => {
+      try {
+        if (img.loading === 'lazy') img.loading = 'eager';
+        if (img.dataset?.src && !img.getAttribute('src')) img.src = img.dataset.src;
+        if (img.dataset?.lazySrc && !img.getAttribute('src')) img.src = img.dataset.lazySrc;
+      } catch (_) {}
+    });
+  });
+
+  await new Promise((r) => setTimeout(r, 8000));
+
+  // Embed each image as data URL so PDF includes pixels
+  const embedStats = await page.evaluate(async () => {
     const imgs = Array.from(document.querySelectorAll('#book img'));
-    await Promise.all(
-      imgs.map((img) => {
-        try {
-          if (img.loading === 'lazy') img.loading = 'eager';
-          if (img.dataset && img.dataset.src && !img.getAttribute('src')) {
-            img.src = img.dataset.src;
-          }
-        } catch (_) {}
-        if (img.complete && img.naturalWidth > 0) return Promise.resolve();
-        return new Promise((resolve) => {
-          const done = () => resolve();
-          img.addEventListener('load', done, { once: true });
-          img.addEventListener('error', done, { once: true });
-          setTimeout(done, 10000);
+    let ok = 0;
+    let fail = 0;
+
+    for (const img of imgs) {
+      const src = img.currentSrc || img.src;
+      if (!src) {
+        fail++;
+        continue;
+      }
+      if (src.startsWith('data:')) {
+        ok++;
+        continue;
+      }
+      try {
+        const res = await fetch(src, { mode: 'cors', credentials: 'omit' });
+        if (!res.ok) throw new Error('http ' + res.status);
+        const blob = await res.blob();
+        const dataUrl = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.onerror = reject;
+          reader.readAsDataURL(blob);
         });
-      })
-    );
-    const ok = imgs.filter((i) => i.complete && i.naturalWidth > 0).length;
-    const bad = imgs.length - ok;
-    return { total: imgs.length, ok, bad };
+        img.src = dataUrl;
+        img.removeAttribute('srcset');
+        ok++;
+      } catch (_) {
+        try {
+          if (img.naturalWidth > 0) {
+            const canvas = document.createElement('canvas');
+            canvas.width = img.naturalWidth;
+            canvas.height = img.naturalHeight;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0);
+            img.src = canvas.toDataURL('image/jpeg', 0.85);
+            img.removeAttribute('srcset');
+            ok++;
+          } else {
+            fail++;
+          }
+        } catch (__) {
+          fail++;
+        }
+      }
+    }
+    return { total: imgs.length, ok, fail };
   });
 
   console.log(
-    `Images: total=${imageStats.total} loaded=${imageStats.ok} failed/empty=${imageStats.bad}`
+    `Embed images: total=${embedStats.total} ok=${embedStats.ok} fail=${embedStats.fail}`
   );
-  await new Promise((r) => setTimeout(r, 5000));
+  await new Promise((r) => setTimeout(r, 3000));
 
   const merged = await PDFDocument.create();
 
@@ -260,22 +304,7 @@ const BATCH = Number(process.env.PDF_BATCH || 5);
       });
     }, start, end);
 
-    await page.evaluate(async (s, e) => {
-      const pages = Array.from(document.querySelectorAll('#book .page')).slice(s, e);
-      const imgs = pages.flatMap((p) => Array.from(p.querySelectorAll('img')));
-      await Promise.all(
-        imgs.map((img) => {
-          if (img.complete && img.naturalWidth > 0) return Promise.resolve();
-          return new Promise((resolve) => {
-            img.addEventListener('load', resolve, { once: true });
-            img.addEventListener('error', resolve, { once: true });
-            setTimeout(resolve, 8000);
-          });
-        })
-      );
-    }, start, end);
-
-    await new Promise((r) => setTimeout(r, 2000));
+    await new Promise((r) => setTimeout(r, 1500));
 
     const buf = await page.pdf({
       format: 'A4',
@@ -298,7 +327,6 @@ const BATCH = Number(process.env.PDF_BATCH || 5);
   await browser.close();
   console.log('Saved', dated);
   console.log('Saved', latest);
-  console.log(`Merged PDF page count target was ${total} source pages`);
 })().catch((err) => {
   console.error(err);
   process.exit(1);
