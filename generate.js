@@ -119,7 +119,10 @@ const path = require('path');
 const URL = process.env.CATALOGUE_URL || 'https://maxtorfitness.com/catalouge/catalouge.html';
 const OUT = path.join(__dirname, 'output');
 const DATE = new Date().toISOString().slice(0, 10);
-const BATCH = Number(process.env.PDF_BATCH || 5);
+
+// A4 landscape points (72 dpi)
+const PAGE_W = 841.89;
+const PAGE_H = 595.28;
 
 (async () => {
   fs.mkdirSync(OUT, { recursive: true });
@@ -132,13 +135,11 @@ const BATCH = Number(process.env.PDF_BATCH || 5);
       '--disable-gpu',
       '--single-process',
       '--no-zygote',
-      '--disable-extensions',
-      '--disable-background-networking',
       '--disable-web-security',
       '--allow-running-insecure-content',
       '--js-flags=--max-old-space-size=350',
     ],
-    defaultViewport: { width: 1200, height: 800 },
+    defaultViewport: { width: 1400, height: 900 },
     executablePath: await chromium.executablePath(),
     headless: chromium.headless,
     protocolTimeout: 60 * 60 * 1000,
@@ -146,13 +147,20 @@ const BATCH = Number(process.env.PDF_BATCH || 5);
 
   const page = await browser.newPage();
   await page.setBypassCSP(true);
-  await page.setViewport({ width: 1200, height: 800 });
+  await page.setViewport({ width: 1400, height: 900 });
   page.setDefaultTimeout(60 * 60 * 1000);
+
+  page.on('requestfailed', (req) => {
+    const u = req.url();
+    if (/\.(png|jpe?g|webp|gif|svg)(\?|$)/i.test(u)) {
+      console.log('IMG FAIL:', u.slice(0, 120), req.failure()?.errorText || '');
+    }
+  });
 
   console.log('Opening', URL);
   await page.goto(URL, { waitUntil: 'domcontentloaded', timeout: 180000 });
 
-  console.log('Waiting for catalogue pages (up to 60 min)…');
+  console.log('Waiting for catalogue pages…');
   const deadline = Date.now() + 60 * 60 * 1000;
   let ready = false;
   let lastLog = '';
@@ -168,7 +176,7 @@ const BATCH = Number(process.env.PDF_BATCH || 5);
         pageCount: pages.length,
         statusText: status ? status.textContent.trim() : '',
         hasError: !!err,
-        errorText: err ? err.textContent.trim().slice(0, 400) : '',
+        errorText: err ? err.textContent.trim().slice(0, 300) : '',
       };
     });
 
@@ -178,9 +186,7 @@ const BATCH = Number(process.env.PDF_BATCH || 5);
       lastLog = line;
     }
 
-    if (state.hasError) {
-      throw new Error('Catalogue error: ' + state.errorText);
-    }
+    if (state.hasError) throw new Error(state.errorText);
     if (state.pageCount > 2 && !state.overlayOn) {
       ready = true;
       break;
@@ -189,18 +195,15 @@ const BATCH = Number(process.env.PDF_BATCH || 5);
       ready = true;
       break;
     }
-
     await new Promise((r) => setTimeout(r, 5000));
   }
 
-  if (!ready) {
-    throw new Error('Catalogue did not finish building within 60 minutes.');
-  }
+  if (!ready) throw new Error('Catalogue did not finish building.');
 
   const total = await page.$$eval('#book .page', (els) => els.length);
-  console.log(`Catalogue ready with ${total} pages. Batch size=${BATCH}`);
+  console.log(`Ready: ${total} pages`);
 
-  // Hide toolbar / overlay
+  // Hide UI chrome
   await page.evaluate(() => {
     const toolbar = document.querySelector('.toolbar');
     if (toolbar) toolbar.style.display = 'none';
@@ -210,118 +213,96 @@ const BATCH = Number(process.env.PDF_BATCH || 5);
       overlay.style.display = 'none';
     }
     document.body.classList.add('exporting');
-  });
-
-  // Show all pages
-  await page.evaluate(() => {
     document.querySelectorAll('#book .slot, #book .page').forEach((el) => {
       el.style.display = '';
     });
   });
 
-  console.log('Loading + embedding product images…');
-
-  // Force eager load
+  // Eager-load images
+  console.log('Waiting for images to load…');
   await page.evaluate(() => {
     document.querySelectorAll('#book img').forEach((img) => {
       try {
         if (img.loading === 'lazy') img.loading = 'eager';
-        if (img.dataset?.src && !img.getAttribute('src')) img.src = img.dataset.src;
-        if (img.dataset?.lazySrc && !img.getAttribute('src')) img.src = img.dataset.lazySrc;
+        if (img.dataset?.src) img.src = img.dataset.src;
       } catch (_) {}
     });
   });
 
-  await new Promise((r) => setTimeout(r, 8000));
-
-  // Embed each image as data URL so PDF includes pixels
-  const embedStats = await page.evaluate(async () => {
+  await page.evaluate(async () => {
     const imgs = Array.from(document.querySelectorAll('#book img'));
-    let ok = 0;
-    let fail = 0;
-
-    for (const img of imgs) {
-      const src = img.currentSrc || img.src;
-      if (!src) {
-        fail++;
-        continue;
-      }
-      if (src.startsWith('data:')) {
-        ok++;
-        continue;
-      }
-      try {
-        const res = await fetch(src, { mode: 'cors', credentials: 'omit' });
-        if (!res.ok) throw new Error('http ' + res.status);
-        const blob = await res.blob();
-        const dataUrl = await new Promise((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onload = () => resolve(reader.result);
-          reader.onerror = reject;
-          reader.readAsDataURL(blob);
-        });
-        img.src = dataUrl;
-        img.removeAttribute('srcset');
-        ok++;
-      } catch (_) {
-        try {
-          if (img.naturalWidth > 0) {
-            const canvas = document.createElement('canvas');
-            canvas.width = img.naturalWidth;
-            canvas.height = img.naturalHeight;
-            const ctx = canvas.getContext('2d');
-            ctx.drawImage(img, 0, 0);
-            img.src = canvas.toDataURL('image/jpeg', 0.85);
-            img.removeAttribute('srcset');
-            ok++;
-          } else {
-            fail++;
-          }
-        } catch (__) {
-          fail++;
-        }
-      }
-    }
-    return { total: imgs.length, ok, fail };
+    await Promise.all(
+      imgs.map(
+        (img) =>
+          new Promise((resolve) => {
+            if (img.complete && img.naturalWidth > 0) return resolve();
+            img.addEventListener('load', resolve, { once: true });
+            img.addEventListener('error', resolve, { once: true });
+            setTimeout(resolve, 12000);
+          })
+      )
+    );
   });
 
-  console.log(
-    `Embed images: total=${embedStats.total} ok=${embedStats.ok} fail=${embedStats.fail}`
-  );
+  const stats = await page.$$eval('#book img', (imgs) => {
+    const ok = imgs.filter((i) => i.complete && i.naturalWidth > 0).length;
+    const sample = imgs.slice(0, 3).map((i) => ({
+      src: (i.currentSrc || i.src || '').slice(0, 80),
+      w: i.naturalWidth,
+      complete: i.complete,
+    }));
+    return { total: imgs.length, ok, bad: imgs.length - ok, sample };
+  });
+  console.log('Image stats:', JSON.stringify(stats));
+
   await new Promise((r) => setTimeout(r, 3000));
 
-  const merged = await PDFDocument.create();
+  // Screenshot each .page → JPEG → PDF page (WYSIWYG, includes images)
+  const pdf = await PDFDocument.create();
+  const handles = await page.$$('#book .page');
 
-  for (let start = 0; start < total; start += BATCH) {
-    const end = Math.min(start + BATCH, total);
-    console.log(`PDF batch ${start + 1}–${end} of ${total}`);
+  for (let i = 0; i < handles.length; i++) {
+    console.log(`Screenshot page ${i + 1}/${handles.length}`);
 
-    await page.evaluate((s, e) => {
-      const pages = Array.from(document.querySelectorAll('#book .page'));
-      pages.forEach((p, i) => {
-        const wrap = p.closest('.slot') || p;
-        wrap.style.display = i >= s && i < e ? 'block' : 'none';
+    // Scroll into view so lazy layouts paint
+    await handles[i].evaluate((el) => {
+      const wrap = el.closest('.slot') || el;
+      wrap.style.display = 'block';
+      el.scrollIntoView({ block: 'center' });
+    });
+    await new Promise((r) => setTimeout(r, 400));
+
+    let shot;
+    try {
+      shot = await handles[i].screenshot({
+        type: 'jpeg',
+        quality: 82,
       });
-    }, start, end);
+    } catch (err) {
+      console.log('Screenshot failed for page', i + 1, err.message);
+      continue;
+    }
 
-    await new Promise((r) => setTimeout(r, 1500));
-
-    const buf = await page.pdf({
-      format: 'A4',
-      landscape: true,
-      printBackground: true,
-      margin: { top: 0, right: 0, bottom: 0, left: 0 },
-      preferCSSPageSize: true,
+    const img = await pdf.embedJpg(shot);
+    const pageDoc = pdf.addPage([PAGE_W, PAGE_H]);
+    pageDoc.drawImage(img, {
+      x: 0,
+      y: 0,
+      width: PAGE_W,
+      height: PAGE_H,
     });
 
-    const part = await PDFDocument.load(buf);
-    const copied = await merged.copyPages(part, part.getPageIndices());
-    copied.forEach((p) => merged.addPage(p));
+    // free memory pressure
+    if ((i + 1) % 10 === 0 && global.gc) {
+      try {
+        global.gc();
+      } catch (_) {}
+    }
   }
 
   const dated = path.join(OUT, `maxtor-catalogue-${DATE}.pdf`);
   const latest = path.join(OUT, 'latest.pdf');
-  fs.writeFileSync(dated, Buffer.from(await merged.save()));
+  fs.writeFileSync(dated, Buffer.from(await pdf.save()));
   fs.copyFileSync(dated, latest);
 
   await browser.close();
